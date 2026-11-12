@@ -6,6 +6,7 @@ import type { Config } from '../config.ts';
 import { signSession, verifyLoginWidget, verifySession, verifyWebAppInitData, type TgUser } from '../auth/telegram.ts';
 import { ALL_STATUSES, AppError, type BookingService, type BookingStatus } from '../services/booking.ts';
 import type { User, UserService } from '../services/users.ts';
+import type { CareService } from '../services/care.ts';
 
 interface Ctx {
   req: IncomingMessage;
@@ -40,6 +41,7 @@ export interface AppDeps {
   cfg: Config;
   bookings: BookingService;
   users: UserService;
+  care: CareService;
   publicDir: string;
   /** Обработчик апдейтов Telegram в режиме вебхука. */
   onTelegramUpdate?: (update: any) => Promise<void>;
@@ -48,7 +50,7 @@ export interface AppDeps {
 }
 
 export function createApp(deps: AppDeps): Server {
-  const { cfg, bookings, users } = deps;
+  const { cfg, bookings, users, care } = deps;
   const routes: Route[] = [];
   const add = (method: string, path: string, auth: Route['auth'], handler: Handler) => {
     const keys: string[] = [];
@@ -122,6 +124,9 @@ export function createApp(deps: AppDeps): Server {
     return { ok: true };
   });
 
+  add('GET', '/api/cars/:id/care', 'user', ({ user, params }) => care.carCare(user!.id, Number(params.id)));
+  add('POST', '/api/bookings/:id/review', 'user', ({ user, params, body }) => care.rate(Number(params.id), user!.id, body?.rating, body?.comment));
+
   add('GET', '/api/bookings', 'user', ({ user }) => bookings.listForUser(user!.id));
   add('POST', '/api/bookings', 'user', async ({ user, body }) => {
     const u = user!;
@@ -150,6 +155,8 @@ export function createApp(deps: AppDeps): Server {
     if (!ALL_STATUSES.includes(status)) throw new AppError(400, 'bad_status', 'Неизвестный статус');
     return bookings.setStatus(Number(params.id), status);
   });
+  add('POST', '/api/admin/bookings/:id/complete', 'admin', ({ params, body }) => bookings.complete(Number(params.id), body ?? {}));
+  add('GET', '/api/admin/reviews', 'admin', () => care.reviewsSummary());
   add('POST', '/api/admin/bookings', 'admin', async ({ body }) => {
     const client = await users.findOrCreateByPhone(String(body?.clientName ?? ''), String(body?.phone ?? ''));
     return bookings.create({

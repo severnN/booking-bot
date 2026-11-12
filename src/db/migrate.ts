@@ -49,7 +49,11 @@ export async function seedIfEmpty(db: Db): Promise<void> {
       ['Шины', 'Балансировка 4 колёс', 30, 1200, 'tire'],
     ];
     for (const [i, it] of items.entries()) {
-      await t.run('INSERT INTO services (category, name, duration_min, price_from, post_kind, sort) VALUES ($1, $2, $3, $4, $5, $6)', [...it, i]);
+      await t.run('INSERT INTO services (category, name, duration_min, price_from, post_kind, sort, is_maintenance) VALUES ($1, $2, $3, $4, $5, $6, $7)', [
+        ...it,
+        i,
+        it[0] === 'ТО',
+      ]);
     }
   });
 }

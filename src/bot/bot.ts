@@ -2,6 +2,7 @@ import type { Config } from '../config.ts';
 import { humanDateTime, localDate } from '../domain/time.ts';
 import { AppError, STATUS_LABEL, type BookingEvent, type BookingService, type BookingView } from '../services/booking.ts';
 import type { UserService } from '../services/users.ts';
+import type { CareService, ReviewEvent } from '../services/care.ts';
 import { esc, TelegramApi, TelegramError } from './api.ts';
 
 type Btn = { text: string; callback_data?: string; web_app?: { url: string } };
@@ -15,16 +16,19 @@ export class Bot {
   cfg: Config;
   bookings: BookingService;
   users: UserService;
+  care: CareService;
   private offset = 0;
   private stopped = false;
   private abort: AbortController | null = null;
 
-  constructor(api: TelegramApi, cfg: Config, bookings: BookingService, users: UserService) {
+  constructor(api: TelegramApi, cfg: Config, bookings: BookingService, users: UserService, care: CareService) {
     this.api = api;
     this.cfg = cfg;
     this.bookings = bookings;
     this.users = users;
+    this.care = care;
     bookings.on((e) => this.onBookingEvent(e));
+    care.on((e) => this.onReviewEvent(e));
   }
 
   private get canOpenWebApp(): boolean {
@@ -114,13 +118,54 @@ export class Bot {
           cancelled: `К сожалению, запись отменена сервисом.\n\n${this.fmt(b)}\n\nВыберите другое время — или позвоните нам${this.cfg.servicePhone ? `: ${esc(this.cfg.servicePhone)}` : ''}.`,
           in_progress: `🔧 Машина в работе: ${esc(b.service.name)}`,
           ready: `🎉 <b>Машина готова!</b> Можно забирать.\n\n${this.fmt(b)}`,
-          done: `Спасибо, что выбрали нас! Будем рады видеть снова.`,
         };
+        if (b.status === 'done') {
+          const extra = [b.mileageKm != null ? `📟 Пробег: ${b.mileageKm.toLocaleString('ru-RU')} км` : '', b.workNotes ? `🛠 ${esc(b.workNotes)}` : '']
+            .filter(Boolean)
+            .join('\n');
+          await this.toClient(
+            b,
+            `Спасибо, что выбрали нас!${extra ? `\n\n${extra}\n<i>Сохранено в истории обслуживания.</i>` : ''}\n\nКак вам визит? Оцените, пожалуйста:`,
+            [[1, 2, 3, 4, 5].map((n) => ({ text: `${n} ⭐`, callback_data: `rate:${b.id}:${n}` }))],
+          );
+          return;
+        }
         const text = msg[b.status];
         if (text) await this.toClient(b, text, b.status === 'cancelled' ? [this.webAppButton('🗓 Выбрать другое время')].filter((r) => r.length) : undefined);
         return;
       }
     }
+  }
+
+  // ---------- отзывы ----------
+
+  async onReviewEvent(e: ReviewEvent): Promise<void> {
+    const r = e.review;
+    const stars = '⭐'.repeat(r.rating);
+    const head = `${stars} <b>${esc(r.serviceName)}</b>, ${esc(humanDateTime(new Date(r.visitDate), this.cfg.timeZone))}\n👤 ${esc(r.clientName || '—')} · запись #${r.bookingId}`;
+    if (e.type === 'commented') {
+      await this.toAdmins(`💬 <b>Отзыв</b>\n${head}\n\n«${esc(r.comment)}»`);
+    } else if (r.rating <= 3) {
+      await this.toAdmins(`⚠️ <b>Низкая оценка</b>\n${head}\n\nСтоит связаться с клиентом.`);
+    }
+  }
+
+  // ---------- напоминания о ТО ----------
+
+  async sendMaintenanceReminders(): Promise<number> {
+    const list = await this.care.claimMaintenanceReminders();
+    for (const m of list) {
+      const fmtDate = (d: Date | string) => new Intl.DateTimeFormat('ru-RU', { timeZone: this.cfg.timeZone, day: 'numeric', month: 'long', year: 'numeric' }).format(new Date(d));
+      const km = (n: number) => `${n.toLocaleString('ru-RU')} км`;
+      const lines = [
+        `🔧 <b>Пора на плановое ТО</b>: ${esc(m.carLabel)}`,
+        `Последнее ТО — ${fmtDate(m.lastDate)}${m.lastMileageKm != null ? `, ${km(m.lastMileageKm)}` : ''}.`,
+        `Рекомендуем до ${fmtDate(m.next.dueDate)}${m.next.dueKm != null ? ` или ${km(m.next.dueKm)}` : ''} — что наступит раньше.`,
+      ];
+      const btn = this.webAppButton('🗓 Записаться на ТО');
+      await this.safeSend(m.tgId, lines.join('\n'), btn.length ? [btn] : undefined);
+    }
+    return list.length;
   }
 
   // ---------- напоминания ----------
@@ -179,6 +224,19 @@ export class Bot {
     if (m.chat?.type !== 'private' || !m.from) return;
     const user = await this.users.upsertTelegram(m.from);
     const chatId = m.chat.id;
+
+    // Ответ на просьбу оставить комментарий к отзыву
+    const replied: string = m.reply_to_message?.from?.is_bot ? (m.reply_to_message.text ?? '') : '';
+    const reviewRef = replied.match(/отзыв к записи #(\d+)/);
+    if (reviewRef && typeof m.text === 'string' && !m.text.startsWith('/')) {
+      try {
+        await this.care.comment(Number(reviewRef[1]), user.id, m.text);
+        await this.api.sendMessage(chatId, 'Спасибо! Передали ваш отзыв команде сервиса 🙏');
+      } catch (e) {
+        await this.api.sendMessage(chatId, e instanceof AppError ? e.message : 'Не удалось сохранить отзыв');
+      }
+      return;
+    }
 
     if (m.contact) {
       if (m.contact.user_id !== m.from.id) {
@@ -251,7 +309,7 @@ export class Bot {
 
   private async handleCallback(q: any): Promise<void> {
     const data: string = q.data ?? '';
-    const [action, idStr] = data.split(':');
+    const [action, idStr, extra] = data.split(':');
     const id = Number(idStr);
     const fromId: number = q.from.id;
     const isAdmin = this.cfg.adminIds.includes(fromId);
@@ -276,6 +334,19 @@ export class Bot {
             reply_markup: status === 'confirmed' ? { inline_keyboard: [[{ text: '🎉 Машина готова', callback_data: `rdy:${b.id}` }]] } : undefined,
           })
           .catch(() => {});
+      } else if (action === 'rate') {
+        const user = await this.users.byTgId(fromId);
+        if (!user) throw new AppError(404, 'user_not_found', 'Сначала нажмите /start');
+        const r = await this.care.rate(id, user.id, Number(extra));
+        answer = 'Спасибо за оценку!';
+        await this.api
+          .call('editMessageReplyMarkup', { chat_id: q.message.chat.id, message_id: q.message.message_id, reply_markup: { inline_keyboard: [] } })
+          .catch(() => {});
+        await this.api.sendMessage(
+          q.message.chat.id,
+          `Ваша оценка: ${'⭐'.repeat(r.rating)}\n\nХотите добавить пару слов? Просто ответьте на это сообщение — отзыв к записи #${id}.`,
+          { reply_markup: { force_reply: true, input_field_placeholder: 'Что понравилось или что улучшить?' } },
+        );
       } else if (action === 'cc' || action === 'x') {
         const user = await this.users.byTgId(fromId);
         if (!user) throw new AppError(404, 'user_not_found', 'Сначала нажмите /start');

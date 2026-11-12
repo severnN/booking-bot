@@ -27,6 +27,7 @@ const app = s
       cfg: s.cfg,
       bookings: s.bookings,
       users: s.users,
+      care: s.care,
       publicDir: new URL('../public', import.meta.url).pathname,
       onTelegramUpdate: (u) => bot.handleUpdate(u),
       healthCheck: async () => void (await s.db.one('SELECT 1')),
@@ -52,7 +53,7 @@ const tick = () => new Promise((r) => setTimeout(r, 50));
 dbTest('полный сценарий: вход через Mini App → запись → уведомление админу → подтверждение кнопкой', async () => {
   base = await listen(app);
   const tgBase = await listen(fakeTg);
-  bot = new Bot(new TelegramApi(BOT_TOKEN, tgBase), s.cfg, s.bookings, s.users);
+  bot = new Bot(new TelegramApi(BOT_TOKEN, tgBase), s.cfg, s.bookings, s.users, s.care);
 
   // статика
   const html = await fetch(base + '/');

@@ -6,6 +6,7 @@ import { createPgPool } from './db/pool.ts';
 import { migrate, seedIfEmpty } from './db/migrate.ts';
 import { BookingService } from './services/booking.ts';
 import { UserService } from './services/users.ts';
+import { CareService } from './services/care.ts';
 import { createApp } from './http/server.ts';
 import { TelegramApi } from './bot/api.ts';
 import { Bot } from './bot/bot.ts';
@@ -35,12 +36,14 @@ await seedIfEmpty(db);
 
 const bookings = new BookingService(db, cfg);
 const users = new UserService(db);
-const bot = cfg.botToken ? new Bot(new TelegramApi(cfg.botToken), cfg, bookings, users) : null;
+const care = new CareService(db, cfg);
+const bot = cfg.botToken ? new Bot(new TelegramApi(cfg.botToken), cfg, bookings, users, care) : null;
 
 const server = createApp({
   cfg,
   bookings,
   users,
+  care,
   publicDir: join(root, 'public'),
   onTelegramUpdate: bot && cfg.botMode === 'webhook' ? (u) => bot.handleUpdate(u) : undefined,
   healthCheck: async () => {
@@ -49,7 +52,7 @@ const server = createApp({
 });
 server.listen(cfg.port, () => console.log(`[http] http://localhost:${cfg.port}`));
 
-let timer: NodeJS.Timeout | null = null;
+const timers: NodeJS.Timeout[] = [];
 if (bot) {
   if (cfg.botMode === 'webhook') {
     await bot.setup().catch((e) => console.error('[bot] setup:', e.message));
@@ -58,9 +61,15 @@ if (bot) {
     void bot.startPolling();
   }
   // Безопасно запускать в каждой копии приложения: записи «забираются» атомарно.
-  timer = setInterval(() => {
-    bot.sendReminders().catch((e) => console.error('[reminders]', e));
-  }, 60_000);
+  timers.push(
+    setInterval(() => {
+      bot.sendReminders().catch((e) => console.error('[reminders]', e));
+    }, 60_000),
+    // Напоминания о плановом ТО — раз в час достаточно.
+    setInterval(() => {
+      bot.sendMaintenanceReminders().catch((e) => console.error('[maintenance]', e));
+    }, 3_600_000),
+  );
 } else {
   console.warn('[bot] BOT_TOKEN не задан — бот и напоминания выключены');
 }
@@ -68,7 +77,7 @@ if (bot) {
 const shutdown = () => {
   console.log('Остановка...');
   bot?.stop();
-  if (timer) clearInterval(timer);
+  timers.forEach(clearInterval);
   server.close(() => {
     db.close().finally(() => process.exit(0));
   });

@@ -54,6 +54,11 @@ export interface BookingView {
   source: string;
   clientConfirmed: boolean;
   client: { id: number; tgId: number | null; name: string; phone: string };
+  /** Итог визита — заполняется при выдаче машины. */
+  mileageKm: number | null;
+  workNotes: string;
+  /** Оценка клиента 1–5, если оставил отзыв. */
+  rating: number | null;
 }
 
 export type BookingEvent =
@@ -327,7 +332,12 @@ export class BookingService {
     const b = await this.get(id);
     if (b.status === status) return b;
     try {
-      await this.db.run('UPDATE bookings SET status = $1, updated_at = now() WHERE id = $2', [status, id]);
+      await this.db.run(
+        `UPDATE bookings SET status = $1, updated_at = now(),
+           done_at = CASE WHEN $1 = 'done' THEN COALESCE(done_at, now()) ELSE done_at END
+         WHERE id = $2`,
+        [status, id],
+      );
     } catch (e) {
       // Например, вернуть отменённую запись, когда её время уже заняли.
       if (pgCode(e) === PG_EXCLUSION_VIOLATION) throw new AppError(409, 'slot_taken', 'Это время уже занято другой записью');
@@ -335,6 +345,26 @@ export class BookingService {
     }
     const view = await this.get(id);
     this.emit({ type: 'status_changed', booking: view, previous: b.status });
+    return view;
+  }
+
+  /**
+   * Выдача машины: статус done + пробег и что сделано — это попадает в историю обслуживания.
+   */
+  async complete(id: number, input: { mileageKm?: unknown; notes?: unknown }): Promise<BookingView> {
+    const mileage = input.mileageKm === undefined || input.mileageKm === null || input.mileageKm === '' ? null : Number(input.mileageKm);
+    if (mileage !== null && (!Number.isInteger(mileage) || mileage < 0 || mileage > 3_000_000)) {
+      throw new AppError(400, 'bad_mileage', 'Проверьте пробег');
+    }
+    const notes = typeof input.notes === 'string' ? input.notes.trim().slice(0, 2000) : '';
+    const b = await this.get(id);
+    if (!['confirmed', 'in_progress', 'ready', 'done'].includes(b.status)) throw new AppError(409, 'not_changeable', 'Эту запись нельзя закрыть');
+    await this.db.run(
+      `UPDATE bookings SET status = 'done', mileage_km = $1, work_notes = $2, done_at = COALESCE(done_at, now()), updated_at = now() WHERE id = $3`,
+      [mileage, notes, id],
+    );
+    const view = await this.get(id);
+    if (b.status !== 'done') this.emit({ type: 'status_changed', booking: view, previous: b.status });
     return view;
   }
 
@@ -371,12 +401,14 @@ const VIEW_SQL = `
          s.id AS s_id, s.name AS s_name, s.duration_min, s.price_from,
          p.name AS post_name,
          c.make, c.model, c.year, c.plate,
-         u.id AS u_id, u.tg_id, u.name AS u_name, u.phone
+         u.id AS u_id, u.tg_id, u.name AS u_name, u.phone,
+         b.mileage_km, b.work_notes, r.rating
   FROM bookings b
   JOIN services s ON s.id = b.service_id
   JOIN posts p ON p.id = b.post_id
   JOIN users u ON u.id = b.user_id
-  LEFT JOIN cars c ON c.id = b.car_id`;
+  LEFT JOIN cars c ON c.id = b.car_id
+  LEFT JOIN reviews r ON r.booking_id = b.id`;
 
 function toService(r: any): Service {
   return { id: r.id, category: r.category, name: r.name, durationMin: r.duration_min, priceFrom: r.price_from, postKind: r.post_kind };
@@ -402,5 +434,8 @@ function toView(r: any): BookingView {
     source: r.source,
     clientConfirmed: !!r.client_confirmed,
     client: { id: r.u_id, tgId: r.tg_id ?? null, name: r.u_name, phone: r.phone },
+    mileageKm: r.mileage_km ?? null,
+    workNotes: r.work_notes ?? '',
+    rating: r.rating ?? null,
   };
 }

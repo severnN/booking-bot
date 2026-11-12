@@ -6,6 +6,7 @@ import { Db, type PoolLike } from '../src/db/sql.ts';
 import { migrate, seedIfEmpty } from '../src/db/migrate.ts';
 import { BookingService } from '../src/services/booking.ts';
 import { UserService } from '../src/services/users.ts';
+import { CareService } from '../src/services/care.ts';
 
 export const BOT_TOKEN = '123456:TEST-TOKEN';
 export const ADMIN_TG = 999;
@@ -74,7 +75,8 @@ export async function makeServices(now: () => Date = () => NOW, extra: Record<st
   const db = await freshDb();
   const bookings = new BookingService(db, cfg, now);
   const users = new UserService(db);
-  return { cfg, db, bookings, users };
+  const care = new CareService(db, cfg, now);
+  return { cfg, db, bookings, users, care };
 }
 
 /** Местное московское время → ISO UTC. */
