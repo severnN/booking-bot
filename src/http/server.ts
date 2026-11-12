@@ -1,6 +1,7 @@
 import { createServer, type IncomingMessage, type ServerResponse, type Server } from 'node:http';
 import { readFile, stat } from 'node:fs/promises';
 import { extname, join, normalize, resolve } from 'node:path';
+import { timingSafeEqual } from 'node:crypto';
 import type { Config } from '../config.ts';
 import { signSession, verifyLoginWidget, verifySession, verifyWebAppInitData, type TgUser } from '../auth/telegram.ts';
 import { ALL_STATUSES, AppError, type BookingService, type BookingStatus } from '../services/booking.ts';
@@ -40,6 +41,10 @@ export interface AppDeps {
   bookings: BookingService;
   users: UserService;
   publicDir: string;
+  /** Обработчик апдейтов Telegram в режиме вебхука. */
+  onTelegramUpdate?: (update: any) => Promise<void>;
+  /** Проверка готовности (например, доступности БД) для /healthz. */
+  healthCheck?: () => Promise<void>;
 }
 
 export function createApp(deps: AppDeps): Server {
@@ -59,8 +64,8 @@ export function createApp(deps: AppDeps): Server {
   };
 
   const isAdmin = (u: User | null) => !!u?.tgId && cfg.adminIds.includes(u.tgId);
-  const login = (tg: TgUser) => {
-    const user = users.upsertTelegram(tg);
+  const login = async (tg: TgUser) => {
+    const user = await users.upsertTelegram(tg);
     return { token: signSession(user.id, cfg.sessionSecret), user, isAdmin: isAdmin(user) };
   };
   const intParam = (v: unknown, name: string) => {
@@ -108,21 +113,21 @@ export function createApp(deps: AppDeps): Server {
 
   // ---------- клиент ----------
 
-  add('GET', '/api/me', 'user', ({ user }) => ({ user, cars: users.cars(user!.id), isAdmin: isAdmin(user) }));
+  add('GET', '/api/me', 'user', async ({ user }) => ({ user, cars: await users.cars(user!.id), isAdmin: isAdmin(user) }));
   add('PUT', '/api/me', 'user', ({ user, body }) => users.updateProfile(user!.id, body ?? {}));
 
   add('POST', '/api/cars', 'user', ({ user, body }) => users.addCar(user!.id, body ?? {}));
-  add('DELETE', '/api/cars/:id', 'user', ({ user, params }) => {
-    users.removeCar(user!.id, Number(params.id));
+  add('DELETE', '/api/cars/:id', 'user', async ({ user, params }) => {
+    await users.removeCar(user!.id, Number(params.id));
     return { ok: true };
   });
 
   add('GET', '/api/bookings', 'user', ({ user }) => bookings.listForUser(user!.id));
-  add('POST', '/api/bookings', 'user', ({ user, body }) => {
+  add('POST', '/api/bookings', 'user', async ({ user, body }) => {
     const u = user!;
     if (!u.consentAt && body?.consent !== true) throw new AppError(400, 'consent_required', 'Нужно согласие на обработку персональных данных');
     const phone = body?.phone ?? u.phone;
-    const fresh = users.updateProfile(u.id, { phone, name: body?.name ?? u.name, consent: body?.consent === true });
+    const fresh = await users.updateProfile(u.id, { phone, name: body?.name ?? u.name, consent: body?.consent === true });
     if (!fresh.phone) throw new AppError(400, 'phone_required', 'Укажите телефон для связи');
     return bookings.create({
       userId: u.id,
@@ -145,8 +150,8 @@ export function createApp(deps: AppDeps): Server {
     if (!ALL_STATUSES.includes(status)) throw new AppError(400, 'bad_status', 'Неизвестный статус');
     return bookings.setStatus(Number(params.id), status);
   });
-  add('POST', '/api/admin/bookings', 'admin', ({ body }) => {
-    const client = users.findOrCreateByPhone(String(body?.clientName ?? ''), String(body?.phone ?? ''));
+  add('POST', '/api/admin/bookings', 'admin', async ({ body }) => {
+    const client = await users.findOrCreateByPhone(String(body?.clientName ?? ''), String(body?.phone ?? ''));
     return bookings.create({
       userId: client.id,
       serviceId: intParam(body?.serviceId, 'serviceId'),
@@ -159,13 +164,13 @@ export function createApp(deps: AppDeps): Server {
 
   // ---------- обработка запроса ----------
 
-  const authenticate = (req: IncomingMessage): User | null => {
+  const authenticate = async (req: IncomingMessage): Promise<User | null> => {
     const h = req.headers.authorization ?? '';
     if (!h.startsWith('Bearer ')) return null;
     const uid = verifySession(h.slice(7), cfg.sessionSecret);
     if (!uid) return null;
     try {
-      return users.get(uid);
+      return await users.get(uid);
     } catch {
       return null;
     }
@@ -194,9 +199,36 @@ export function createApp(deps: AppDeps): Server {
     res.end(data);
   };
 
+  /**
+   * Вебхук Telegram. Проверяем секрет из заголовка, отвечаем 200 даже при ошибке обработки:
+   * иначе Telegram будет повторять один и тот же апдейт.
+   */
+  const handleWebhook = async (req: IncomingMessage, res: ServerResponse) => {
+    if (req.method !== 'POST' || !deps.onTelegramUpdate || !cfg.webhookSecret) return send(res, 404, { error: 'not_found' });
+    const got = Buffer.from(String(req.headers['x-telegram-bot-api-secret-token'] ?? ''));
+    const want = Buffer.from(cfg.webhookSecret);
+    if (got.length !== want.length || !timingSafeEqual(got, want)) return send(res, 401, { error: 'unauthorized' });
+    const update = await readJson(req, 1024 * 1024);
+    try {
+      await deps.onTelegramUpdate(update);
+    } catch (e) {
+      console.error('[webhook] update', update?.update_id, e);
+    }
+    return send(res, 200, { ok: true });
+  };
+
   return createServer(async (req, res) => {
     const url = new URL(req.url ?? '/', 'http://localhost');
     try {
+      if (url.pathname === '/healthz') {
+        try {
+          await deps.healthCheck?.();
+          return send(res, 200, { ok: true });
+        } catch {
+          return send(res, 503, { ok: false });
+        }
+      }
+      if (url.pathname === '/telegram/webhook') return await handleWebhook(req, res);
       if (!url.pathname.startsWith('/api/')) {
         if (req.method !== 'GET' && req.method !== 'HEAD') return send(res, 405, { error: 'method_not_allowed' });
         return await serveStatic(res, url.pathname);
@@ -209,7 +241,7 @@ export function createApp(deps: AppDeps): Server {
         if (r.method !== req.method) continue;
         const params: Record<string, string> = {};
         r.keys.forEach((k, i) => (params[k] = m[i + 1]));
-        const user = r.auth === 'none' ? null : authenticate(req);
+        const user = r.auth === 'none' ? null : await authenticate(req);
         if (r.auth !== 'none' && !user) throw new AppError(401, 'unauthorized', 'Нужно войти');
         if (r.auth === 'admin' && !isAdmin(user)) throw new AppError(403, 'forbidden', 'Только для администратора');
         const body = req.method === 'GET' ? null : await readJson(req);

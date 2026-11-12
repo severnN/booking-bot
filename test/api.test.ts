@@ -1,11 +1,11 @@
-import { test, after } from 'node:test';
+import { after } from 'node:test';
 import assert from 'node:assert/strict';
 import { createServer, type Server } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { createApp } from '../src/http/server.ts';
 import { TelegramApi } from '../src/bot/api.ts';
 import { Bot } from '../src/bot/bot.ts';
-import { makeServices, msk, ADMIN_TG, BOT_TOKEN, makeInitData } from './helpers.ts';
+import { dbTest, makeServices, msk, ADMIN_TG, BOT_TOKEN, makeInitData, TEST_DB_URL } from './helpers.ts';
 
 const listen = (srv: Server) => new Promise<string>((r) => srv.listen(0, '127.0.0.1', () => r(`http://127.0.0.1:${(srv.address() as AddressInfo).port}`)));
 
@@ -20,10 +20,19 @@ const fakeTg = createServer(async (req, res) => {
   res.end(JSON.stringify({ ok: true, result: method === 'getUpdates' ? [] : { message_id: 1 } }));
 });
 
-const s = makeServices();
-const app = createApp({ cfg: s.cfg, bookings: s.bookings, users: s.users, publicDir: new URL('../public', import.meta.url).pathname });
-let base = '';
+const s = TEST_DB_URL ? await makeServices() : (null as never);
 let bot: Bot;
+const app = s
+  ? createApp({
+      cfg: s.cfg,
+      bookings: s.bookings,
+      users: s.users,
+      publicDir: new URL('../public', import.meta.url).pathname,
+      onTelegramUpdate: (u) => bot.handleUpdate(u),
+      healthCheck: async () => void (await s.db.one('SELECT 1')),
+    })
+  : createServer();
+let base = '';
 
 after(() => {
   app.close();
@@ -40,7 +49,7 @@ const call = async (path: string, opts: { method?: string; body?: unknown; token
 };
 const tick = () => new Promise((r) => setTimeout(r, 50));
 
-test('полный сценарий: вход через Mini App → запись → уведомление админу → подтверждение кнопкой', async () => {
+dbTest('полный сценарий: вход через Mini App → запись → уведомление админу → подтверждение кнопкой', async () => {
   base = await listen(app);
   const tgBase = await listen(fakeTg);
   bot = new Bot(new TelegramApi(BOT_TOKEN, tgBase), s.cfg, s.bookings, s.users);
@@ -98,14 +107,14 @@ test('полный сценарий: вход через Mini App → запис
   // не-админ не может подтвердить кнопкой
   tgCalls.length = 0;
   await bot.handleUpdate({ callback_query: { id: 'q1', data: `ok:${created.data.id}`, from: { id: 1001 }, message: { chat: { id: 1001 }, message_id: 5 } } });
-  assert.equal(s.bookings.get(created.data.id).status, 'pending');
+  assert.equal((await s.bookings.get(created.data.id)).status, 'pending');
   assert.match(tgCalls.find((c) => c.method === 'answerCallbackQuery')!.params.text, /администратора/);
 
   // админ подтверждает → клиенту уходит «подтверждена»
   tgCalls.length = 0;
   await bot.handleUpdate({ callback_query: { id: 'q2', data: `ok:${created.data.id}`, from: { id: ADMIN_TG, first_name: 'Админ' }, message: { chat: { id: ADMIN_TG }, message_id: 7 } } });
   await tick();
-  assert.equal(s.bookings.get(created.data.id).status, 'confirmed');
+  assert.equal((await s.bookings.get(created.data.id)).status, 'confirmed');
   assert.ok(tgCalls.some((c) => c.method === 'editMessageText' && c.params.reply_markup.inline_keyboard[0][0].callback_data === `rdy:${created.data.id}`));
   assert.ok(tgCalls.some((c) => c.method === 'sendMessage' && c.params.chat_id === 1001 && /подтверждена/.test(c.params.text)));
 
@@ -124,10 +133,10 @@ test('полный сценарий: вход через Mini App → запис
 
   // клиент жмёт «Буду»
   await bot.handleUpdate({ callback_query: { id: 'q3', data: `cc:${created.data.id}`, from: { id: 1001 }, message: { chat: { id: 1001 }, message_id: 9 } } });
-  assert.equal(s.bookings.get(created.data.id).clientConfirmed, true);
+  assert.equal((await s.bookings.get(created.data.id)).clientConfirmed, true);
 });
 
-test('админ: вход, расписание, запись по телефону, смена статуса', async () => {
+dbTest('админ: вход, расписание, запись по телефону, смена статуса', async () => {
   const auth = await call('/api/auth/dev', { method: 'POST', body: { tgId: ADMIN_TG, name: 'Админ' } });
   const token = auth.data.token;
   assert.equal(auth.data.isAdmin, true);
@@ -146,14 +155,34 @@ test('админ: вход, расписание, запись по телефо
   assert.equal((await call(`/api/admin/bookings/${created.data.id}/status`, { method: 'POST', token, body: { status: 'hacked' } })).status, 400);
 });
 
-test('бот: /start просит номер и даёт кнопку Mini App; чужой контакт не принимается', async () => {
+dbTest('бот: /start просит номер и даёт кнопку Mini App; чужой контакт не принимается', async () => {
   tgCalls.length = 0;
   await bot.handleUpdate({ message: { chat: { id: 7007, type: 'private' }, from: { id: 7007, first_name: 'Новый' }, text: '/start' } });
   assert.ok(tgCalls.some((c) => c.params.reply_markup?.keyboard?.[0]?.[0]?.request_contact));
   assert.ok(tgCalls.some((c) => c.params.reply_markup?.inline_keyboard?.[0]?.[0]?.web_app?.url === 'https://example.com'));
 
   await bot.handleUpdate({ message: { chat: { id: 7007, type: 'private' }, from: { id: 7007 }, contact: { user_id: 1, phone_number: '+70000000000' } } });
-  assert.equal(s.users.byTgId(7007)!.phone, '');
+  assert.equal((await s.users.byTgId(7007))!.phone, '');
   await bot.handleUpdate({ message: { chat: { id: 7007, type: 'private' }, from: { id: 7007 }, contact: { user_id: 7007, phone_number: '79005556677' } } });
-  assert.equal(s.users.byTgId(7007)!.phone, '+79005556677');
+  assert.equal((await s.users.byTgId(7007))!.phone, '+79005556677');
+});
+
+dbTest('вебхук: проверка секрета, апдейт обрабатывается, /healthz', async () => {
+  const post = (secret: string | null, body: unknown) =>
+    fetch(base + '/telegram/webhook', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', ...(secret ? { 'X-Telegram-Bot-Api-Secret-Token': secret } : {}) },
+      body: JSON.stringify(body),
+    });
+  const upd = { update_id: 1, message: { chat: { id: 8008, type: 'private' }, from: { id: 8008, first_name: 'Вебхук' }, text: '/start' } };
+  assert.equal((await post(null, upd)).status, 401);
+  assert.equal((await post('wrong-secret-wrong-sec', upd)).status, 401);
+  tgCalls.length = 0;
+  assert.equal((await post('test-webhook-secret-123', upd)).status, 200);
+  assert.ok(await s.users.byTgId(8008), 'пользователь создан из апдейта');
+  assert.ok(tgCalls.some((c) => c.method === 'sendMessage' && c.params.chat_id === 8008));
+  // Ошибка в обработке не должна превращаться в 500, иначе Telegram будет повторять апдейт
+  assert.equal((await post('test-webhook-secret-123', { update_id: 2, callback_query: { id: 'x', data: 'ok:999999', from: { id: ADMIN_TG }, message: { chat: { id: 1 }, message_id: 1 } } })).status, 200);
+  const h = await fetch(base + '/healthz');
+  assert.equal(h.status, 200);
 });

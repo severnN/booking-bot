@@ -29,7 +29,12 @@ export interface Config {
   /** Публичный HTTPS-адрес веб-клиента (нужен Telegram для Mini App). */
   webAppUrl: string;
   port: number;
-  dbPath: string;
+  /** postgres://user:pass@host:5432/db */
+  databaseUrl: string;
+  /** webhook — для продакшена (несколько копий за балансировщиком), polling — для разработки. */
+  botMode: 'webhook' | 'polling';
+  /** Секрет, который Telegram присылает в заголовке X-Telegram-Bot-Api-Secret-Token. */
+  webhookSecret: string;
   sessionSecret: string;
   adminIds: number[];
   /** Чат (личка админа или рабочая группа), куда падают новые записи. */
@@ -70,7 +75,9 @@ export function readConfig(env: NodeJS.ProcessEnv = process.env): Config {
     botUsername: env.BOT_USERNAME ?? '',
     webAppUrl: env.WEBAPP_URL ?? '',
     port: Number(env.PORT ?? 3000),
-    dbPath: env.DB_PATH ?? './data/autoservice.db',
+    databaseUrl: env.DATABASE_URL ?? '',
+    botMode: env.BOT_MODE === 'polling' ? 'polling' : 'webhook',
+    webhookSecret: env.WEBHOOK_SECRET ?? '',
     sessionSecret: env.SESSION_SECRET ?? '',
     adminIds: (env.ADMIN_TG_IDS ?? '')
       .split(',')

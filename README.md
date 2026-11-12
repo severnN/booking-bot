@@ -9,16 +9,17 @@
 
 ```
 public/            веб-клиент (Mini App + PWA), без сборки
+migrations/        SQL-миграции PostgreSQL, применяются при старте
 src/
-  main.ts          точка входа: HTTP + бот + напоминания
+  main.ts          точка входа: миграции, HTTP, бот (вебхук или polling), напоминания
   config.ts        настройки из .env
-  db.ts            SQLite: схема, миграции, демо-каталог
+  db/              пул pg, обёртка с транзакциями, мигратор, демо-каталог
   domain/          расчёт слотов и часовые пояса (чистые функции)
   services/        записи, пользователи, гараж
   auth/            проверка initData, Login Widget, сессии
-  http/server.ts   REST API + раздача статики
+  http/server.ts   REST API, вебхук Telegram, /healthz, статика
   bot/             Bot API клиент, команды, уведомления, напоминания
-test/              node:test — 19 тестов
+test/              node:test; support/pgmini.ts — тестовый драйвер PG на случай, если pg не установлен
 ```
 
 ## Что умеет MVP
@@ -30,45 +31,60 @@ test/              node:test — 19 тестов
 **Админ** (Telegram ID в `ADMIN_TG_IDS`): новые записи и переносы приходят в чат с кнопками; в приложении — вкладка «Расписание» по постам с кнопками смены статуса и запись клиента по телефону (без Telegram).
 
 **Под капотом:**
-- Посты (подъёмники, шиномонтаж): у каждой услуги свой тип поста, слот свободен, пока свободен хоть один пост нужного типа.
-- Защита от двойной брони: проверка и вставка в одной транзакции `BEGIN IMMEDIATE`.
-- Время в БД — UTC, часы работы — в часовом поясе сервиса (с учётом перехода на летнее время).
-- Лимит 3 активные записи на клиента, минимальный запас до начала (`MIN_LEAD_MIN`), горизонт записи (`HORIZON_DAYS`), закрытые даты (`closed_dates`).
+- **PostgreSQL.** Время — `timestamptz`, часы работы — в часовом поясе сервиса (с учётом перехода на летнее время).
+- **Двойная бронь исключена на двух уровнях:** advisory lock по типу поста в транзакции записи и `EXCLUDE USING gist` в схеме — база физически не даст двум активным записям пересечься на одном посту. Тест: 10 параллельных записей на одно время → проходят ровно 2 (по числу подъёмников).
+- **Посты** (подъёмники, шиномонтаж): у каждой услуги свой тип поста, слот свободен, пока свободен хоть один пост нужного типа.
+- **Вебхук** с проверкой `X-Telegram-Bot-Api-Secret-Token`; ошибка обработки не возвращает 5xx, чтобы Telegram не повторял апдейт.
+- **Напоминания** «забираются» одним `UPDATE … FOR UPDATE SKIP LOCKED` — при нескольких копиях приложения каждое уходит ровно один раз.
+- Лимит 3 активные записи на клиента (с блокировкой строки клиента), минимальный запас до начала (`MIN_LEAD_MIN`), горизонт записи (`HORIZON_DAYS`), закрытые даты (`closed_dates`).
 
 ## Запуск
 
-Нужен Node.js ≥ 22.18 (TypeScript запускается напрямую, без сборки). Внешних зависимостей нет.
+### Docker (рекомендуется)
 
 ```bash
-cp .env.example .env      # заполнить BOT_TOKEN, SESSION_SECRET, ADMIN_TG_IDS, WEBAPP_URL
+cp .env.example .env      # BOT_TOKEN, BOT_USERNAME, WEBAPP_URL, SESSION_SECRET, WEBHOOK_SECRET, ADMIN_TG_IDS
+docker compose up -d --build
+```
+
+Поднимется PostgreSQL 16 и приложение на порту 3000; миграции применятся сами. Перед ним нужен HTTPS (Caddy, nginx + Let's Encrypt или облачный балансировщик) — Telegram открывает Mini App и шлёт вебхуки только по https.
+
+### Без Docker
+
+Нужны Node.js ≥ 22.18 (TypeScript запускается напрямую, без сборки) и PostgreSQL ≥ 13 с расширением `btree_gist` (есть в стандартной поставке и в managed-базах).
+
+```bash
+npm install
+cp .env.example .env      # + DATABASE_URL
 npm start
 ```
 
-Локально без бота: `DEV_LOGIN=1`, без `BOT_TOKEN` → открыть http://localhost:3000 и войти по любому ID (999 — если он есть в `ADMIN_TG_IDS`).
+### Локальная разработка
 
-Тесты и проверка типов:
+`BOT_MODE=polling` — бот работает без публичного адреса (только одна копия приложения). Без бота совсем: не задавать `BOT_TOKEN`, включить `DEV_LOGIN=1` → http://localhost:3000, вход по любому ID (ID из `ADMIN_TG_IDS` — админ). Для Mini App внутри Telegram нужен https-туннель: `ngrok http 3000` или `cloudflared tunnel`.
+
+### Тесты
 
 ```bash
-npm i            # только typescript и @types/node для typecheck
-npm test
+docker compose up -d db
+TEST_DATABASE_URL=postgres://booking:booking@localhost:5432/booking npm test
 npm run typecheck
 ```
 
-Docker: `docker build -t autoservice . && docker run --env-file .env -p 3000:3000 -v $PWD/data:/app/data autoservice`
+Тесты, которым нужна база, создают себе отдельную временную БД и удаляют её; без `TEST_DATABASE_URL` они пропускаются, остальные выполняются.
 
 ### Подключение к Telegram
 
 1. @BotFather → `/newbot` → токен в `BOT_TOKEN`, имя в `BOT_USERNAME`.
-2. Развернуть на сервере с HTTPS (или для разработки — `ngrok http 3000` / `cloudflared tunnel`), адрес в `WEBAPP_URL`. При старте бот сам поставит кнопку меню «Записаться».
+2. `WEBAPP_URL` — публичный https-адрес приложения, `WEBHOOK_SECRET` — `openssl rand -hex 32`. При старте приложение само вызовет `setWebhook` на `WEBAPP_URL/telegram/webhook` и поставит кнопку меню «Записаться».
 3. Для входа в веб-версии вне Telegram: @BotFather → `/setdomain` → домен из `WEBAPP_URL`.
 4. Для уведомлений в рабочую группу: добавить бота в группу, её ID — в `ADMIN_CHAT_ID`.
 
-Каталог услуг и посты при первом запуске заполняются демо-данными (`seedIfEmpty` в `src/db.ts`) — поправьте под свой сервис.
+Каталог услуг и посты при первом запуске заполняются демо-данными (`seedIfEmpty` в `src/db/migrate.ts`) — поправьте под свой сервис.
 
 ## Что дальше
 
-- **PostgreSQL** вместо SQLite, когда понадобится несколько инстансов: SQL сосредоточен в `services/`, проверка занятости — под `SELECT … FOR UPDATE` или exclusion constraint.
-- **Фреймворки:** при желании `http/server.ts` → Fastify, `bot/` → grammY; сервисный слой не меняется.
-- Вебхук вместо long polling, админка для каталога/выходных, оплата через Telegram Payments, история обслуживания и напоминания о ТО по пробегу, отзывы, мультифилиальность.
+- Админка для каталога услуг, постов и выходных дней.
+- Оплата через Telegram Payments (нужен выбор провайдера).
 - Нативное приложение: тот же `public/` оборачивается в Capacitor.
 - ПДн: для РФ — хранение на серверах в РФ (152-ФЗ) и политика обработки, ссылка на неё рядом с галочкой согласия.
