@@ -63,3 +63,8 @@ textarea { min-height: 70px; resize: vertical; }
 .empty { text-align: center; color: var(--hint); padding: 24px 8px; }
 .success { text-align: center; padding: 24px 8px; }
 .success .icon { font-size: 44px; }
+.stars { color: #f5a524; letter-spacing: 1px; }
+.star { background: none; border: 0; font-size: 24px; line-height: 1; color: #f5a524; cursor: pointer; padding: 0 2px; }
+.notice { background: var(--bg2); border-radius: 10px; padding: 10px 12px; margin: 8px 0; font-size: 14px; }
+.notice.warn { background: #fff4d6; color: #5c3d00; }
+.record { padding: 8px 0; border-top: 1px solid color-mix(in srgb, var(--hint) 15%, transparent); font-size: 14px; }

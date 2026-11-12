@@ -50,6 +50,13 @@ export interface Config {
   serviceName: string;
   serviceAddress: string;
   servicePhone: string;
+  /** Плановое ТО: раз в N месяцев или каждые N км — что наступит раньше. */
+  maintenanceMonths: number;
+  maintenanceKm: number;
+  /** За сколько дней до расчётной даты ТО напомнить. */
+  maintenanceNoticeDays: number;
+  /** Средний пробег в месяц, если по истории его не посчитать. */
+  avgKmPerMonth: number;
   /** Только для локальной разработки: вход без Telegram по tg_id. Никогда не включать в проде. */
   devLogin: boolean;
 }
@@ -92,6 +99,10 @@ export function readConfig(env: NodeJS.ProcessEnv = process.env): Config {
     serviceName: env.SERVICE_NAME ?? 'Автосервис',
     serviceAddress: env.SERVICE_ADDRESS ?? '',
     servicePhone: env.SERVICE_PHONE ?? '',
+    maintenanceMonths: Number(env.MAINTENANCE_MONTHS ?? 12),
+    maintenanceKm: Number(env.MAINTENANCE_KM ?? 10000),
+    maintenanceNoticeDays: Number(env.MAINTENANCE_NOTICE_DAYS ?? 14),
+    avgKmPerMonth: Number(env.AVG_KM_PER_MONTH ?? 1250),
     devLogin: env.DEV_LOGIN === '1',
   };
 }

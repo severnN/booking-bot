@@ -92,6 +92,11 @@ const addDays = (d, n) => {
   t.setUTCDate(t.getUTCDate() + n);
   return t.toISOString().slice(0, 10);
 };
+const plural = (n, one, few, many) => {
+  const m10 = n % 10, m100 = n % 100;
+  return m10 === 1 && m100 !== 11 ? one : m10 >= 2 && m10 <= 4 && (m100 < 12 || m100 > 14) ? few : many;
+};
+const km = (n) => `${Number(n).toLocaleString('ru-RU')} км`;
 const rub = (n) => `от ${Number(n).toLocaleString('ru-RU')} ₽`;
 const dur = (m) => (m >= 60 ? `${Math.floor(m / 60)} ч${m % 60 ? ` ${m % 60} мин` : ''}` : `${m} мин`);
 const badge = (s) => el('span', { class: `badge ${s}` }, STATUS[s] || s);
@@ -364,7 +369,10 @@ async function renderBookings() {
       el('div', {}, fmtDateTime(b.start)),
       b.car ? el('div', { class: 'muted' }, b.car) : null,
       b.comment ? el('div', { class: 'muted' }, `«${b.comment}»`) : null,
+      b.mileageKm != null ? el('div', { class: 'muted' }, `Пробег: ${km(b.mileageKm)}`) : null,
+      b.workNotes ? el('div', { class: 'muted' }, `Сделано: ${b.workNotes}`) : null,
     );
+    if (b.status === 'done') card.append(ratingRow(b));
     if (['pending', 'confirmed'].includes(b.status) && new Date(b.start).getTime() > now) {
       const move = el('button', { class: 'btn secondary small' }, 'Перенести');
       const cancel = el('button', { class: 'btn danger small' }, 'Отменить');
@@ -399,7 +407,61 @@ async function renderBookings() {
   );
 }
 
+function ratingRow(b) {
+  const box = el('div', { style: 'margin-top:10px' });
+  const render = (rating) => {
+    if (rating) {
+      box.replaceChildren(el('span', { class: 'muted' }, 'Ваша оценка: '), el('span', { class: 'stars' }, '★'.repeat(rating) + '☆'.repeat(5 - rating)));
+      return;
+    }
+    const row = el('div', { class: 'row' }, el('span', { class: 'muted' }, 'Оцените визит:'));
+    for (let n = 1; n <= 5; n++) {
+      const star = el('button', { class: 'star', type: 'button', title: `${n}` }, '☆');
+      star.onmouseenter = () => row.querySelectorAll('.star').forEach((s, i) => (s.textContent = i < n ? '★' : '☆'));
+      star.onclick = withBusy(star, async () => {
+        await api(`/api/bookings/${b.id}/review`, { method: 'POST', body: { rating: n } });
+        haptic('success');
+        toast('Спасибо за оценку!');
+        render(n);
+      });
+      row.append(star);
+    }
+    row.onmouseleave = () => row.querySelectorAll('.star').forEach((s) => (s.textContent = '☆'));
+    box.replaceChildren(row);
+  };
+  render(b.rating);
+  return box;
+}
+
 // ---------- гараж ----------
+
+const fmtDate = (iso) => new Intl.DateTimeFormat('ru-RU', { timeZone: tz(), day: 'numeric', month: 'long', year: 'numeric' }).format(new Date(iso));
+
+async function renderCarCare(car, box) {
+  box.replaceChildren(el('div', { class: 'muted' }, 'Загрузка…'));
+  const { records, next } = await api(`/api/cars/${car.id}/care`);
+  const parts = [];
+  if (next) {
+    const soon = new Date(next.dueDate).getTime() - Date.now() < 30 * 86400000;
+    parts.push(el('div', { class: `notice${soon ? ' warn' : ''}` },
+      el('b', {}, 'Следующее ТО: '),
+      `до ${fmtDate(next.dueDate)}`, next.dueKm != null ? ` или ${km(next.dueKm)}` : '', ' — что наступит раньше',
+      soon ? el('div', { style: 'margin-top:8px' }, el('a', { class: 'btn small', href: '#/' }, 'Записаться на ТО')) : null,
+    ));
+  } else if (records.length) {
+    parts.push(el('div', { class: 'muted' }, 'Плановое ТО у нас ещё не проходили — после первого подскажем, когда следующее.'));
+  }
+  if (!records.length) parts.push(el('div', { class: 'muted' }, 'История появится после первого визита.'));
+  for (const r of records) {
+    parts.push(el('div', { class: 'record' },
+      el('div', { class: 'row between' }, el('b', {}, r.serviceName), el('span', { class: 'muted' }, fmtDate(r.date))),
+      r.mileageKm != null ? el('div', { class: 'muted' }, km(r.mileageKm)) : null,
+      r.notes ? el('div', {}, r.notes) : null,
+    ));
+  }
+  box.replaceChildren(...parts);
+}
+
 
 function renderGarage() {
   const { cars } = state.me;
@@ -413,7 +475,16 @@ function renderGarage() {
       await loadMe();
       renderGarage();
     });
-    list.append(el('div', { class: 'row between', style: 'padding:10px 0' }, el('span', {}, c.label), del));
+    const careBox = el('div', { hidden: true });
+    const hist = el('button', { class: 'btn secondary small' }, 'История и ТО');
+    hist.onclick = () => {
+      careBox.hidden = !careBox.hidden;
+      if (!careBox.hidden) renderCarCare(c, careBox).catch((e) => careBox.replaceChildren(el('div', { class: 'muted' }, e.message)));
+    };
+    list.append(el('div', { style: 'padding:10px 0' },
+      el('div', { class: 'row between' }, el('span', {}, c.label), el('div', { class: 'row' }, hist, del)),
+      careBox,
+    ));
   }
   const make = el('input', { placeholder: 'Kia' });
   const model = el('input', { placeholder: 'Rio' });
@@ -442,8 +513,21 @@ const ADMIN_ACTIONS = {
   pending: [['confirmed', 'Подтвердить'], ['cancelled', 'Отклонить']],
   confirmed: [['in_progress', 'В работу'], ['no_show', 'Не приехал'], ['cancelled', 'Отменить']],
   in_progress: [['ready', 'Готова']],
-  ready: [['done', 'Выдана']],
+  ready: [['done', 'Выдать клиенту']],
 };
+
+/** Выдача машины: пробег и что сделано — уходит в историю обслуживания клиента. */
+function completeForm(b, onDone) {
+  const mileage = el('input', { type: 'number', inputmode: 'numeric', placeholder: 'Пробег, км' });
+  const notes = el('textarea', { placeholder: 'Что сделано: работы, запчасти, рекомендации' });
+  const save = el('button', { class: 'btn small' }, 'Выдать');
+  save.onclick = withBusy(save, async () => {
+    await api(`/api/admin/bookings/${b.id}/complete`, { method: 'POST', body: { mileageKm: mileage.value, notes: notes.value } });
+    toast('Готово, клиенту отправлена просьба оценить визит');
+    onDone();
+  });
+  return el('div', { style: 'margin-top:8px' }, el('label', {}, 'Пробег при выдаче'), mileage, el('label', {}, 'Что сделано'), notes, el('div', { style: 'height:8px' }), save);
+}
 
 function renderAdmin(date = todayLocal()) {
   const datesRow = el('div', { class: 'chips' });
@@ -459,7 +543,8 @@ function renderAdmin(date = todayLocal()) {
   const formBox = el('div');
   newBtn.onclick = () => { newBtn.hidden = true; formBox.replaceChildren(adminNewBookingForm(() => renderAdmin(date))); };
 
-  $app.replaceChildren(el('div', { class: 'card' }, el('h2', {}, 'Расписание'), datesRow), newBtn, formBox, el('div', { style: 'height:12px' }), listBox);
+  const reviewsBox = el('div');
+  $app.replaceChildren(el('div', { class: 'card' }, el('h2', {}, 'Расписание'), datesRow), newBtn, formBox, el('div', { style: 'height:12px' }), listBox, reviewsBox);
 
   api(`/api/admin/schedule?date=${date}`).then(({ posts, bookings }) => {
     const out = [];
@@ -471,10 +556,12 @@ function renderAdmin(date = todayLocal()) {
         const actions = el('div', { class: 'row wrap', style: 'margin-top:8px' });
         for (const [status, label] of ADMIN_ACTIONS[b.status] || []) {
           const btn = el('button', { class: `btn small ${status === 'cancelled' || status === 'no_show' ? 'secondary' : ''}` }, label);
-          btn.onclick = withBusy(btn, async () => {
-            await api(`/api/admin/bookings/${b.id}/status`, { method: 'POST', body: { status } });
-            renderAdmin(date);
-          });
+          btn.onclick = status === 'done'
+            ? () => { actions.replaceWith(completeForm(b, () => renderAdmin(date))); }
+            : withBusy(btn, async () => {
+                await api(`/api/admin/bookings/${b.id}/status`, { method: 'POST', body: { status } });
+                renderAdmin(date);
+              });
           actions.append(btn);
         }
         card.append(el('div', { style: 'padding:10px 0; border-top:1px solid color-mix(in srgb, var(--hint) 15%, transparent)' },
@@ -483,6 +570,8 @@ function renderAdmin(date = todayLocal()) {
           el('div', { class: 'muted' }, b.client.name || 'Без имени', ' · ', b.client.phone ? el('a', { href: `tel:${b.client.phone}` }, b.client.phone) : 'нет телефона',
             b.source === 'admin' ? ' · по телефону' : '', b.clientConfirmed ? ' · 👍 подтвердил визит' : ''),
           b.comment ? el('div', { class: 'muted' }, `«${b.comment}»`) : null,
+          b.mileageKm != null || b.workNotes ? el('div', { class: 'muted' }, [b.mileageKm != null ? km(b.mileageKm) : '', b.workNotes].filter(Boolean).join(' · ')) : null,
+          b.rating ? el('div', { class: 'stars' }, '★'.repeat(b.rating) + '☆'.repeat(5 - b.rating)) : null,
           actions,
         ));
       }
@@ -490,6 +579,20 @@ function renderAdmin(date = todayLocal()) {
     }
     listBox.replaceChildren(...out);
   }).catch((e) => listBox.replaceChildren(el('div', { class: 'card empty' }, e.message)));
+
+  api('/api/admin/reviews').then(({ average, count, recent }) => {
+    const card = el('div', { class: 'card' }, el('h2', {}, 'Отзывы'));
+    if (!count) card.append(el('div', { class: 'muted' }, 'Пока нет'));
+    else card.append(el('div', {}, el('span', { class: 'stars' }, '★ ' + average.toFixed(1)), el('span', { class: 'muted' }, ` · ${count} ${plural(count, 'оценка', 'оценки', 'оценок')}`)));
+    for (const r of recent.slice(0, 10)) {
+      card.append(el('div', { class: 'record' },
+        el('div', { class: 'row between' }, el('span', { class: 'stars' }, '★'.repeat(r.rating) + '☆'.repeat(5 - r.rating)), el('span', { class: 'muted' }, fmtDate(r.visitDate))),
+        el('div', { class: 'muted' }, `${r.serviceName} · ${r.clientName || 'Без имени'}`),
+        r.comment ? el('div', {}, `«${r.comment}»`) : null,
+      ));
+    }
+    reviewsBox.replaceChildren(card);
+  }).catch(() => {});
 }
 
 function adminNewBookingForm(onDone) {
