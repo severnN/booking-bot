@@ -128,7 +128,8 @@ export class Bot {
   async sendReminders(): Promise<number> {
     let sent = 0;
     for (const kind of ['24h', '2h'] as const) {
-      for (const b of this.bookings.dueReminders(kind)) {
+      // claimReminders сразу помечает записи — даже если доставка не удастся (бот заблокирован), повторно не шлём.
+      for (const b of await this.bookings.claimReminders(kind)) {
         const head = kind === '24h' ? '⏰ Напоминаем о записи на завтра' : '⏰ Через 2 часа ждём вас';
         const buttons: Btn[][] = b.clientConfirmed
           ? []
@@ -136,8 +137,6 @@ export class Bot {
         const reschedule = this.webAppButton('🔁 Перенести', '#/bookings');
         if (reschedule.length) buttons.push(reschedule);
         await this.toClient(b, `${head}\n\n${this.fmt(b)}${this.cfg.serviceAddress ? `\n📍 ${esc(this.cfg.serviceAddress)}` : ''}`, buttons);
-        // Помечаем даже при ошибке доставки (бот заблокирован) — чтобы не долбить каждую минуту.
-        this.bookings.markReminded(b.id, kind);
         sent++;
       }
     }
@@ -159,6 +158,18 @@ export class Bot {
     }
   }
 
+  /** Режим вебхука: Telegram сам присылает апдейты на {WEBAPP_URL}/telegram/webhook. */
+  async setWebhook(): Promise<void> {
+    const url = new URL('/telegram/webhook', this.cfg.webAppUrl).toString();
+    await this.api.call('setWebhook', {
+      url,
+      secret_token: this.cfg.webhookSecret,
+      allowed_updates: ['message', 'callback_query'],
+      max_connections: 40,
+    });
+    console.log(`[bot] webhook: ${url}`);
+  }
+
   async handleUpdate(u: any): Promise<void> {
     if (u.message) return this.handleMessage(u.message);
     if (u.callback_query) return this.handleCallback(u.callback_query);
@@ -166,7 +177,7 @@ export class Bot {
 
   private async handleMessage(m: any): Promise<void> {
     if (m.chat?.type !== 'private' || !m.from) return;
-    const user = this.users.upsertTelegram(m.from);
+    const user = await this.users.upsertTelegram(m.from);
     const chatId = m.chat.id;
 
     if (m.contact) {
@@ -174,7 +185,7 @@ export class Bot {
         await this.api.sendMessage(chatId, 'Пожалуйста, отправьте свой номер кнопкой ниже.');
         return;
       }
-      this.users.setPhone(user.id, m.contact.phone_number);
+      await this.users.setPhone(user.id, m.contact.phone_number);
       await this.api.sendMessage(chatId, 'Спасибо, номер сохранён 👍', { reply_markup: { remove_keyboard: true } });
       await this.sendMenu(chatId);
       return;
@@ -212,7 +223,7 @@ export class Bot {
   }
 
   private async sendMyBookings(chatId: number, userId: number): Promise<void> {
-    const active = this.bookings.listForUser(userId).filter((b) => ['pending', 'confirmed', 'in_progress', 'ready'].includes(b.status));
+    const active = (await this.bookings.listForUser(userId)).filter((b) => ['pending', 'confirmed', 'in_progress', 'ready'].includes(b.status));
     if (active.length === 0) {
       await this.api.sendMessage(chatId, 'Активных записей нет.', this.canOpenWebApp ? { reply_markup: { inline_keyboard: [this.webAppButton()] } } : {});
       return;
@@ -225,7 +236,7 @@ export class Bot {
 
   private async sendToday(chatId: number): Promise<void> {
     const date = localDate(new Date(), this.cfg.timeZone);
-    const { bookings } = this.bookings.schedule(date);
+    const { bookings } = await this.bookings.schedule(date);
     const list = bookings.filter((b) => b.status !== 'cancelled');
     if (list.length === 0) {
       await this.api.sendMessage(chatId, 'На сегодня записей нет.');
@@ -247,12 +258,12 @@ export class Bot {
     let answer = '';
     try {
       if (action === 'my') {
-        const user = this.users.upsertTelegram(q.from);
+        const user = await this.users.upsertTelegram(q.from);
         await this.sendMyBookings(q.message.chat.id, user.id);
       } else if (action === 'ok' || action === 'no' || action === 'rdy') {
         if (!isAdmin) throw new AppError(403, 'forbidden', 'Только для администратора');
         const status = action === 'ok' ? 'confirmed' : action === 'no' ? 'cancelled' : 'ready';
-        const b = this.bookings.setStatus(id, status);
+        const b = await this.bookings.setStatus(id, status);
         answer = STATUS_LABEL[b.status];
         // Обновляем сообщение в админ-чате: убираем кнопки, дописываем кто и что сделал.
         const who = esc([q.from.first_name, q.from.last_name].filter(Boolean).join(' '));
@@ -266,13 +277,13 @@ export class Bot {
           })
           .catch(() => {});
       } else if (action === 'cc' || action === 'x') {
-        const user = this.users.byTgId(fromId);
+        const user = await this.users.byTgId(fromId);
         if (!user) throw new AppError(404, 'user_not_found', 'Сначала нажмите /start');
         if (action === 'cc') {
-          this.bookings.confirmByClient(id, user.id);
+          await this.bookings.confirmByClient(id, user.id);
           answer = 'Спасибо, ждём вас!';
         } else {
-          this.bookings.cancelByClient(id, user.id);
+          await this.bookings.cancelByClient(id, user.id);
           answer = 'Запись отменена';
         }
         await this.api.call('editMessageReplyMarkup', { chat_id: q.message.chat.id, message_id: q.message.message_id }).catch(() => {});
@@ -287,8 +298,11 @@ export class Bot {
 
   // ---------- long polling ----------
 
-  async start(): Promise<void> {
+  /** Режим long polling — для разработки. Работает только в одной копии приложения. */
+  async startPolling(): Promise<void> {
     await this.setup().catch((e) => console.error('[bot] setup:', e.message));
+    // getUpdates не работает, пока установлен вебхук.
+    await this.api.call('deleteWebhook', { drop_pending_updates: false }).catch(() => {});
     console.log('[bot] polling started');
     while (!this.stopped) {
       try {
